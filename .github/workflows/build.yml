@@ -58,7 +58,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: release-${{ needs.check-and-sync.outputs.short_sha }}
-          name: aria2 Custom Build ${{ needs.check-and-sync.outputs.short_sha }
+          name: aria2 Custom Build ${{ needs.check-and-sync.outputs.short_sha }}
           files: aria2c.exe
           draft: false
           prerelease: false
