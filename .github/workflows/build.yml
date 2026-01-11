@@ -4,99 +4,61 @@ on: [push, pull_request]
 
 jobs:
   build:
-    strategy:
-      matrix:
-        os: [ubuntu-22.04, macos-14]
-        compiler: [gcc, clang]
-        crypto: [openssl, gnutls]
-        bittorrent: [with-bt, without-bt]
-        exclude:
-        - os: macos-14
-          crypto: gnutls
-        - crypto: openssl
-          bittorrent: without-bt
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
-    - name: Linux setup
-      if: runner.os == 'Linux'
-      run: |
-        sudo apt-get update
-        sudo apt-get install \
-          g++-12 \
-          clang-15 \
-          autoconf \
-          automake \
-          autotools-dev \
-          autopoint \
-          libtool \
-          pkg-config \
-          libssl-dev \
-          libgnutls28-dev \
-          libc-ares-dev \
-          zlib1g-dev \
-          libsqlite3-dev \
-          libssh2-1-dev \
-          libcppunit-dev
-    - name: MacOS setup
-      if: runner.os == 'macOS'
-      run: |
-        brew install cppunit gettext openssl libssh2 c-ares sqlite3 \
-          autoconf automake pkg-config libtool
-    - name: Setup clang (Linux)
-      if: runner.os == 'Linux' && matrix.compiler == 'clang'
-      run: |
-        echo 'CC=clang-15' >> $GITHUB_ENV
-        echo 'CXX=clang++-15' >> $GITHUB_ENV
-    - name: Setup clang (MacOS)
-      if: runner.os == 'macOS' && matrix.compiler == 'clang'
-      run: |
-        echo 'CC=clang' >> $GITHUB_ENV
-        echo 'CXX=clang++' >> $GITHUB_ENV
-    - name: Setup gcc (Linux)
-      if: runner.os == 'Linux' && matrix.compiler == 'gcc'
-      run: |
-        echo 'CC=gcc-12' >> $GITHUB_ENV
-        echo 'CXX=g++-12' >> $GITHUB_ENV
-    - name: Setup gcc (MacOS)
-      if: runner.os == 'macOS' && matrix.compiler == 'gcc'
-      run: |
-        echo 'CC=gcc' >> $GITHUB_ENV
-        echo 'CXX=g++' >> $GITHUB_ENV
-    - name: Libtool
-      run: |
-        autoreconf -i
-    - name: Setup compiler flags
-      run: |
-        asanflags="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-        CPPFLAGS="$asanflags -g3"
-        LDFLAGS="$asanflags"
+      - name: Get Current Date
+        run: echo "BUILD_DATE=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
 
-        echo 'CPPFLAGS='"$CPPFLAGS" >> $GITHUB_ENV
-        echo 'LDFLAGS='"$LDFLAGS" >> $GITHUB_ENV
-    - name: Disable BitTorrent
-      if: matrix.bittorrent == 'without-bt'
-      run: |
-        FEATURE_FLAGS="$FEATURE_FLAGS --disable-bittorrent"
+      - name: Unlock aria2 limits
+        run: |
+          echo "Unlocking limits in src/OptionHandlerFactory.cc..."
+          # remove max-connection-per-server limit
+          sed -i "s/\"1\", 1, 16, 'x'/\"1\", 1, -1, 'x'/g" src/OptionHandlerFactory.cc
+          # remove min-split-size limit
+          sed -i "s/\"20M\", 1_m, 1_g, 'k'/\"20M\", 1, -1, 'k'/g" src/OptionHandlerFactory.cc
+          # remove socket-recv-buffer-size limit
+          sed -i "s/\"1M\", 1_m, 1_g/\"1M\", 1, -1/g" src/OptionHandlerFactory.cc
+          # remove piece-length limit
+          sed -i "s/\"0\", 0, 16_m/\"0\", 0, -1/g" src/OptionHandlerFactory.cc
 
-        echo 'FEATURE_FLAGS='"$FEATURE_FLAGS" >> $GITHUB_ENV
-    - name: Configure autotools (Linux, gnutls)
-      if: runner.os == 'Linux' && matrix.crypto == 'gnutls'
-      run: |
-        ./configure --with-gnutls --without-openssl $FEATURE_FLAGS
-    - name: Configure autotools (Linux, openssl)
-      if: runner.os == 'Linux' && matrix.crypto == 'openssl'
-      run: |
-        ./configure --without-gnutls --with-openssl $FEATURE_FLAGS
-    - name: Configure autotools (macOS)
-      if: runner.os == 'macOS'
-      run: |
-        ./configure \
-          --without-openssl --without-gnutls --with-appletls \
-          --disable-nls
-    - name: Build aria2
-      run: |
-        make -j"$(nproc 2> /dev/null || sysctl -n hw.ncpu)" check
+      - name: Patch Dockerfile
+        run: |
+          echo "Replacing the gmplib.org link with GNU FTP mirror in Dockerfile.mingw..."
+          # Unable to download files from gmplib.org via GitHub Actions, patch url here
+          sed -i 's|https://gmplib.org/download/gmp/|https://ftp.gnu.org/gnu/gmp/|g' Dockerfile.mingw
+
+          echo "Patching the Dockerfile to use the local source..."
+          sed -i '/ADD https:\/\/api.github.com/,$d' Dockerfile.mingw
+          cat <<EOF >> Dockerfile.mingw
+          COPY . /aria2
+          WORKDIR /aria2
+          RUN autoreconf -i && ./mingw-config && make -j\$(nproc) && \\
+              \$HOST-strip src/aria2c.exe
+          EOF
+
+      - name: Build Windows x64 Binary
+        run: |
+          # Build using the provided Mingw Dockerfile
+          docker build \
+            --tag aria2-mingw-x64 \
+            --build-arg HOST=x86_64-w64-mingw32 \
+            --file Dockerfile.mingw \
+            .
+
+          # Extract the compiled binary
+          container_id=$(docker create aria2-mingw-x64)
+          docker cp $container_id:/aria2/src/aria2c.exe aria2c.exe
+          docker rm -v $container_id
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: release-${{ needs.check-and-sync.outputs.short_sha }}
+          name: aria2 Custom Build ${{ needs.check-and-sync.outputs.short_sha }
+          files: aria2c.exe
+          draft: false
+          prerelease: false
